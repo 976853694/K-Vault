@@ -106,6 +106,7 @@
       grid-template-columns: 270px minmax(0, 1fr);
       gap: 14px;
       align-items: start;
+      margin-top: 14px;
     }
     .folder-sidebar {
       position: sticky;
@@ -200,7 +201,7 @@
       border: 1px solid rgba(255, 255, 255, 0.65);
       border-radius: 12px;
       background: rgba(255, 255, 255, 0.86);
-      margin-bottom: 10px;
+      margin-bottom: 14px;
       font-size: 13px;
       color: #555;
     }
@@ -271,6 +272,7 @@
     @media (max-width: 980px) {
       .disk-layout {
         grid-template-columns: 1fr;
+        margin-top: 12px;
       }
       .folder-sidebar {
         position: static;
@@ -469,9 +471,9 @@
             <div class="folder-head">
               <span><i class="fas fa-folder-tree"></i> 目录管理</span>
               <span>
-                <el-button size="mini" circle icon="el-icon-plus" title="新建目录" @click="createFolder"></el-button>
-                <el-button size="mini" circle icon="el-icon-edit" title="重命名目录" :disabled="!folderPath" @click="renameCurrentFolder"></el-button>
-                <el-button size="mini" circle icon="el-icon-delete" title="删除目录" :disabled="!folderPath" @click="deleteCurrentFolder"></el-button>
+                <el-button size="mini" circle icon="el-icon-plus" title="新建目录" :disabled="folderMutating" :loading="folderMutatingAction === 'create'" @click="createFolder"></el-button>
+                <el-button size="mini" circle icon="el-icon-edit" title="重命名目录" :disabled="folderMutating || !folderPath" :loading="folderMutatingAction === 'rename'" @click="renameCurrentFolder"></el-button>
+                <el-button size="mini" circle icon="el-icon-delete" title="删除目录" :disabled="folderMutating || !folderPath" :loading="folderMutatingAction === 'delete'" @click="deleteCurrentFolder"></el-button>
               </span>
             </div>
             <div class="folder-current">当前位置：/{{ folderPath || '' }}</div>
@@ -858,6 +860,8 @@
       folders: [],
       folderPath: '',
       folderLoading: false,
+      folderMutating: false,
+      folderMutatingAction: '',
       dragState: {
         active: false,
         fileIds: [],
@@ -1089,6 +1093,73 @@
         if (!['grid', 'list'].includes(mode)) return;
         this.viewMode = mode;
       },
+      cloneFoldersSnapshot() {
+        return Array.isArray(this.folders) ? this.folders.map((item) => ({ ...item })) : [];
+      },
+      sortFoldersLocal() {
+        this.folders = [...(this.folders || [])].sort((a, b) => {
+          const pathA = this.normalizeFolderPath(a.path || a.folderPath || '');
+          const pathB = this.normalizeFolderPath(b.path || b.folderPath || '');
+          const depthA = Number.isFinite(a.depth) ? a.depth : (pathA ? pathA.split('/').length : 0);
+          const depthB = Number.isFinite(b.depth) ? b.depth : (pathB ? pathB.split('/').length : 0);
+          if (depthA !== depthB) return depthA - depthB;
+          return pathA.localeCompare(pathB, 'zh-CN', { sensitivity: 'base' });
+        });
+      },
+      buildFolderNode(path, fileCount = 0) {
+        const normalized = this.normalizeFolderPath(path);
+        if (!normalized) return null;
+        const segments = normalized.split('/');
+        return {
+          path: normalized,
+          name: segments[segments.length - 1] || normalized,
+          parentPath: segments.length > 1 ? segments.slice(0, -1).join('/') : '',
+          depth: segments.length,
+          fileCount: Number(fileCount || 0),
+        };
+      },
+      ensureFolderBranchLocal(path) {
+        const normalized = this.normalizeFolderPath(path);
+        if (!normalized) return;
+        const parts = normalized.split('/');
+        let current = '';
+        parts.forEach((part) => {
+          current = current ? `${current}/${part}` : part;
+          const exists = (this.folders || []).some((folder) => {
+            return this.normalizeFolderPath(folder.path || folder.folderPath || '') === current;
+          });
+          if (!exists) {
+            const node = this.buildFolderNode(current, 0);
+            if (node) this.folders.push(node);
+          }
+        });
+        this.sortFoldersLocal();
+      },
+      renameFolderBranchLocal(sourcePath, targetPath) {
+        const source = this.normalizeFolderPath(sourcePath);
+        const target = this.normalizeFolderPath(targetPath);
+        if (!source || !target || source === target) return;
+        this.folders = (this.folders || []).map((folder) => {
+          const current = this.normalizeFolderPath(folder.path || folder.folderPath || '');
+          if (!current || (current !== source && !current.startsWith(`${source}/`))) {
+            return folder;
+          }
+          const suffix = current === source ? '' : current.slice(source.length + 1);
+          const nextPath = suffix ? `${target}/${suffix}` : target;
+          const nextNode = this.buildFolderNode(nextPath, Number(folder.fileCount || 0));
+          return nextNode ? { ...folder, ...nextNode } : folder;
+        });
+        this.sortFoldersLocal();
+      },
+      removeFolderBranchLocal(path) {
+        const target = this.normalizeFolderPath(path);
+        if (!target) return;
+        this.folders = (this.folders || []).filter((folder) => {
+          const current = this.normalizeFolderPath(folder.path || folder.folderPath || '');
+          return current !== target && !current.startsWith(`${target}/`);
+        });
+        this.sortFoldersLocal();
+      },
       async selectFolder(path = '') {
         const normalized = this.normalizeFolderPath(path);
         if (normalized === this.folderPath && this.tableData.length > 0) return;
@@ -1115,6 +1186,7 @@
         }
       },
       async createFolder() {
+        if (this.folderMutating) return;
         const seed = this.folderPath ? `${this.folderPath}/新目录` : '新目录';
         try {
           const prompt = await this.$prompt('请输入目录路径（例如：项目A/一月）', '新建目录', {
@@ -1124,23 +1196,53 @@
             inputValidator: (value) => !!this.normalizeFolderPath(value) || '目录路径不能为空',
           });
           const path = this.normalizeFolderPath(prompt.value);
-          await fetch('./api/manage/folders', {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path }),
-          }).then((r) => r.json());
-          this.$message.success('目录创建成功');
-          await this.fetchFolders();
-          await this.selectFolder(path);
-        } catch (error) {
-          if (error !== 'cancel') {
-            this.$message.info('已取消创建目录');
+          if (!path) return;
+
+          const existed = (this.folders || []).some((folder) => this.normalizeFolderPath(folder.path || folder.folderPath || '') === path);
+          if (existed) {
+            await this.selectFolder(path);
+            this.$message.info('目录已存在，已切换到该目录');
+            return;
           }
+
+          const previousFolders = this.cloneFoldersSnapshot();
+          const previousFolderPath = this.folderPath;
+
+          this.folderMutating = true;
+          this.folderMutatingAction = 'create';
+          this.ensureFolderBranchLocal(path);
+          this.folderPath = path;
+          this.currentPage = 1;
+          this.tableData = [];
+          this.nextCursor = null;
+
+          try {
+            const response = await fetch('./api/manage/folders', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path }),
+            }).then((r) => r.json());
+
+            if (!response?.success) throw new Error(response?.error || '目录创建失败');
+
+            this.$message.success('目录创建成功');
+            await Promise.all([this.fetchFolders(), this.refreshFileList()]);
+          } catch (error) {
+            this.folders = previousFolders;
+            this.folderPath = previousFolderPath;
+            await this.refreshFileList();
+            this.$message.error(error.message || '目录创建失败');
+          } finally {
+            this.folderMutating = false;
+            this.folderMutatingAction = '';
+          }
+        } catch (error) {
+          if (error !== 'cancel' && error !== 'close') this.$message.error(error.message || '目录创建失败');
         }
       },
       async renameCurrentFolder() {
-        if (!this.folderPath) return;
+        if (!this.folderPath || this.folderMutating) return;
         const parts = this.folderPath.split('/');
         const oldName = parts[parts.length - 1] || '';
         const prefix = parts.slice(0, -1).join('/');
@@ -1154,25 +1256,40 @@
           const newName = String(prompt.value || '').trim();
           const targetPath = this.normalizeFolderPath(prefix ? `${prefix}/${newName}` : newName);
           if (!targetPath || targetPath === this.folderPath) return;
-          const res = await fetch('./api/manage/folders', {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sourcePath: this.folderPath, targetPath }),
-          }).then((r) => r.json());
-          if (!res.success) throw new Error(res.error || '重命名失败');
-          this.$message.success('目录重命名成功');
+
+          const sourcePath = this.folderPath;
+          const previousFolders = this.cloneFoldersSnapshot();
+          this.folderMutating = true;
+          this.folderMutatingAction = 'rename';
+          this.renameFolderBranchLocal(sourcePath, targetPath);
           this.folderPath = targetPath;
-          await this.fetchFolders();
-          await this.refreshFileList();
-        } catch (error) {
-          if (error !== 'cancel') {
+
+          try {
+            const res = await fetch('./api/manage/folders', {
+              method: 'PUT',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sourcePath, targetPath }),
+            }).then((r) => r.json());
+
+            if (!res?.success) throw new Error(res?.error || '重命名失败');
+            this.$message.success('目录重命名成功');
+            await Promise.all([this.fetchFolders(), this.refreshFileList()]);
+          } catch (error) {
+            this.folders = previousFolders;
+            this.folderPath = sourcePath;
+            await this.refreshFileList();
             this.$message.error(error.message || '目录重命名失败');
+          } finally {
+            this.folderMutating = false;
+            this.folderMutatingAction = '';
           }
+        } catch (error) {
+          if (error !== 'cancel' && error !== 'close') this.$message.error(error.message || '目录重命名失败');
         }
       },
       async deleteCurrentFolder() {
-        if (!this.folderPath) return;
+        if (!this.folderPath || this.folderMutating) return;
         try {
           await this.$confirm('确认删除该目录标记并将目录内文件移回根目录？文件直链不会失效。', '删除目录', {
             type: 'warning',
@@ -1181,19 +1298,38 @@
           });
           const target = this.folderPath;
           const parent = target.split('/').slice(0, -1).join('/');
-          const response = await fetch(`./api/manage/folders?path=${encodeURIComponent(target)}&recursive=1`, {
-            method: 'DELETE',
-            credentials: 'include',
-          }).then((r) => r.json());
-          if (!response.success) throw new Error(response.error || '删除目录失败');
+
+          const previousFolders = this.cloneFoldersSnapshot();
+          const previousFolderPath = this.folderPath;
+
+          this.folderMutating = true;
+          this.folderMutatingAction = 'delete';
+          this.removeFolderBranchLocal(target);
           this.folderPath = this.normalizeFolderPath(parent);
-          await this.fetchFolders();
-          await this.refreshFileList();
-          this.$message.success('目录删除成功');
-        } catch (error) {
-          if (error !== 'cancel') {
+          this.currentPage = 1;
+          this.tableData = [];
+          this.nextCursor = null;
+
+          try {
+            const response = await fetch(`./api/manage/folders?path=${encodeURIComponent(target)}&recursive=1`, {
+              method: 'DELETE',
+              credentials: 'include',
+            }).then((r) => r.json());
+
+            if (!response?.success) throw new Error(response?.error || '删除目录失败');
+            await Promise.all([this.fetchFolders(), this.refreshFileList()]);
+            this.$message.success('目录删除成功');
+          } catch (error) {
+            this.folders = previousFolders;
+            this.folderPath = previousFolderPath;
+            await this.refreshFileList();
             this.$message.error(error.message || '目录删除失败');
+          } finally {
+            this.folderMutating = false;
+            this.folderMutatingAction = '';
           }
+        } catch (error) {
+          if (error !== 'cancel' && error !== 'close') this.$message.error(error.message || '目录删除失败');
         }
       },
       async moveSelectedToFolder() {
